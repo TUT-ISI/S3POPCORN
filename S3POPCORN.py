@@ -16,10 +16,11 @@ from scipy.interpolate import interp1d
 from sklearn.neighbors import KNeighborsRegressor
 import time
 from sklearn.utils import parallel_backend
+import warnings
 
 # #########################################################################
 # POPCORN Sentinel-3 Synergy aerosol parameter post-process correction
-# CODE VERSION 27 Aug 2021.
+# CODE VERSION 30 Aug 2021 (accuracy + spatial).
 #
 #   * Developed by: Finnish Meteorological Institute and University of Eastern Finland
 #   * Development of the algorithm was funded by the European Space Agency
@@ -27,6 +28,8 @@ from sklearn.utils import parallel_backend
 #   * Contact info: Antti Lipponen (antti.lipponen@fmi.fi)
 #
 # #########################################################################
+
+runSpatialCorrection = True  # to run spatial correction in addition to accuracy correction
 
 
 # #########################################################################
@@ -399,7 +402,7 @@ def loadS3_SY_OL_SL(SYfilename, OLfilename, SLfilename, n_jobs=8):
             radiance_an, solar_irradiance_an, radiance_ao, solar_irradiance_ao = None, None, None, None
         archive.close()
 
-        print('Final computations...')
+        print('Preparing geometry information...')
         vaa = data['SYN_O_VAA']
         saa = data['SYN_O_SAA']
         relAz = np.abs(saa - vaa - 180.0)
@@ -427,9 +430,138 @@ def loadS3_SY_OL_SL(SYfilename, OLfilename, SLfilename, n_jobs=8):
     return data
 
 
+class UNET_DEEP(pl.LightningModule):
+
+    def __init__(self, config=None, lr=None, batch_size=None, input_size=None, output_size=None, train_dataset=None, val_dataset=None):
+        super(UNET_DEEP, self).__init__()
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.batch_size = batch_size
+        self.lr = lr
+
+        # # Layer weights # #
+        # Descending path weights
+        self.conv1 = nn.Conv2d(1, 8, 5, padding=2, padding_mode="replicate")
+        self.conv2 = nn.Conv2d(8, 8, 5, padding=2, padding_mode="replicate")
+        self.conv3 = nn.Conv2d(8, 16, 5, padding=2, padding_mode="replicate")
+        self.conv4 = nn.Conv2d(16, 16, 5, padding=2, padding_mode="replicate")
+        self.conv5 = nn.Conv2d(16, 32, 5, padding=2, padding_mode="replicate")
+        self.conv6 = nn.Conv2d(32, 32, 5, padding=2, padding_mode="replicate")
+        self.conv7 = nn.Conv2d(32, 64, 5, padding=2, padding_mode="replicate")
+        self.conv8 = nn.Conv2d(64, 64, 5, padding=2, padding_mode="replicate")
+
+        # Upsample layer
+        self.upSample = nn.Upsample(scale_factor=2)
+
+        # Ascending path weights
+        self.conv9 = nn.Conv2d(64, 32, 5, padding=2, padding_mode="replicate")
+        self.conv10 = nn.Conv2d(64, 32, 5, padding=2, padding_mode="replicate")
+        self.conv11 = nn.Conv2d(32, 16, 5, padding=2, padding_mode="replicate")
+        self.conv12 = nn.Conv2d(32, 16, 5, padding=2, padding_mode="replicate")
+        self.conv13 = nn.Conv2d(16, 8, 5, padding=2, padding_mode="replicate")
+        self.conv14 = nn.Conv2d(16, 8, 5, padding=2, padding_mode="replicate")
+        self.conv15 = nn.Conv2d(8, 1, 5, padding=2, padding_mode="replicate")
+        self.conv16 = nn.Conv2d(1, 1, 5, padding=2, padding_mode="replicate")
+
+    def forward(self, x0):
+        # Descending path
+        x10 = F.relu(self.conv1(x0))
+        x11 = F.relu(self.conv2(x10))
+        x12 = F.max_pool2d(x11,(2,2))
+        x20 = F.relu(self.conv3(x12))
+        x21 = F.relu(self.conv4(x20))
+        x22 = F.max_pool2d(x21,(2,2))
+        x30 = F.relu(self.conv5(x22))
+        x31 = F.relu(self.conv6(x30))
+        x32 = F.dropout(x31,0.5)
+        x33 = F.max_pool2d(x32,(2,2))
+        x40 = F.relu(self.conv7(x33))
+        x41 = F.relu(self.conv8(x40))
+        x5 = F.dropout(x41, 0.5)
+        # Ascending path
+        x60 = self.upSample(x5)
+        x61 = F.relu(self.conv9(x60))
+        m6 = torch.cat((x61, x31), 1)
+        x62 = F.relu(self.conv10(m6))
+        x70 = self.upSample(x62)
+        x71 = F.relu(self.conv11(x70))
+        m7 = torch.cat((x71, x21), 1)
+        x72 = F.relu(self.conv12(m7))
+        x80 = self.upSample(x72)
+        x81 = F.relu(self.conv13(x80))
+        m8 = torch.cat((x81, x11), 1)
+        x82 = F.relu(self.conv14(m8))
+        x9 = F.relu(self.conv15(x82))
+        x = self.conv16(x9)
+        return x
+
+    def mse_loss(self, x, y):
+        return F.mse_loss(x, y)
+
+    def training_step(self, train_batch, batch_idx):
+        x, y = train_batch
+        y_hat = self.forward(x)
+        loss = self.mse_loss(y_hat, y)
+        self.log("train_loss", loss, on_epoch=True, logger=True)
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x, y = val_batch
+        y_hat = self.forward(x)
+        loss = self.mse_loss(y_hat, y)
+        self.log('val_loss', loss, on_epoch=True, logger=True)
+        return {"val_loss": loss}
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
+
+
+def expand_image(image, kernel_size=128, stride_length=96):
+    # Image is a numpy 2D-matrix
+    # Making the image dimensions so (dim-kernel_size)%(stride_length) == 0
+    if (image.shape[0] - kernel_size) % stride_length > 0:
+        nan_row = np.zeros((stride_length - (image.shape[0] - kernel_size) % stride_length, image.shape[1])) * np.nan
+        image = np.concatenate((image, nan_row), axis=0)
+    if (image.shape[1] - kernel_size) % stride_length > 0:
+        nan_column = np.zeros((image.shape[0], stride_length - (image.shape[1] - kernel_size) % stride_length)) * np.nan
+        image = np.concatenate((image, nan_column), axis=1)
+    return image
+
+
+def Normalize_data(data, mean, std):
+    # Normalize a numpy array or torch tensor
+    return (data - mean) * (std)**(-1)
+
+
+def Inverse_normalize(data, mean, std):
+    # Inverse a normalized numpy array or torch tensor
+    return data * (std) + mean
+
+
+def predict_with_model(model, input_image, norm_params_inputs, norm_params_outputs):
+    # The input image is not normalized before running this function (a torch tensor!!)
+    # The output is the corrected image inverse normalized (in the right scale)
+    # Normalizing input
+    input_mean, input_std = norm_params_inputs[0], norm_params_inputs[2]
+    output_mean, output_std = norm_params_outputs[0], norm_params_outputs[2]
+
+    input_data = Normalize_data(input_image, input_mean, input_std)
+    input_data = torch.tensor(input_data).type(torch.float)
+    predicted_error = model.forward(input_data)
+    predicted_error = predicted_error.detach().numpy()
+    # Inv. normalize
+    predicted_error = Inverse_normalize(predicted_error, output_mean, output_std)
+    corrected_im = input_image + predicted_error
+    return corrected_im
+
+
 print('')
 print('POPCORN Sentinel-3 Synergy aerosol parameter post-process correction')
-print('CODE VERSION 27 Aug 2021.')
+print('CODE VERSION 30 Aug 2021 (accuracy + spatial correction).')
 print('')
 print('  Finnish Meteorological Institute and University of Eastern Finland')
 print('  Development of the algorithm was funded by the European Space Agency EO science for society programme via POPCORN project.')
@@ -606,7 +738,7 @@ saves = {
     'bestdataMASK': bestdataMASK
 }
 
-# Run post-process correction
+# Run post-process accuracy correction
 Npixels = S3dataMASK.sum()
 coordsii, coordsjj = np.where(S3dataMASK)
 MAXpixelsatonce = 250000
@@ -626,6 +758,63 @@ for indx in range(0, Npixels, MAXpixelsatonce):
     saves['AOD_CORR'][2, this_coordsii, this_coordsjj] = np.clip(S3data['SYN_AOD550'][this_coordsii, this_coordsjj] * (500.0 / 550.0)**-S3data['SYN_AE550'][this_coordsii, this_coordsjj] + predicted_approx_err[:, 2], a_min=0.005, a_max=10)
     saves['AOD_CORR'][3, this_coordsii, this_coordsjj] = np.clip(S3data['SYN_AOD550'][this_coordsii, this_coordsjj] * (675.0 / 550.0)**-S3data['SYN_AE550'][this_coordsii, this_coordsjj] + predicted_approx_err[:, 3], a_min=0.005, a_max=10)
     saves['AOD_CORR'][4, this_coordsii, this_coordsjj] = np.clip(S3data['SYN_AOD550'][this_coordsii, this_coordsjj] * (870.0 / 550.0)**-S3data['SYN_AE550'][this_coordsii, this_coordsjj] + predicted_approx_err[:, 4], a_min=0.005, a_max=10)
+
+
+# Spatial correction
+if runSpatialCorrection:
+    t0 = time.time()
+    print('Running spatial correction...')
+    norm_params_inputs = np.load(os.path.join('models', 'normalization_constants_inputs.npy'))
+    norm_params_outputs = np.load(os.path.join('models', 'normalization_constants_outputs.npy'))
+    fold_stride = 96
+    NET = UNET_DEEP()
+    model = NET.load_from_checkpoint(os.path.join('models', 'unet_17_8'))
+
+    for ii in range(len(saves['AOD_CORR'])):
+        wavelengths = [440.0, 500.0, 550.0, 675.0, 870.0]
+        print('  AOD ', wavelengths[ii], ' nm')
+        out_data = expand_image(np.squeeze(saves['AOD_CORR'][ii]), kernel_size=128, stride_length=fold_stride)
+        nan_mask = np.isnan(out_data)
+
+        out_data = np.expand_dims(out_data, axis=(0, 1))
+        out_data = torch.tensor(out_data)
+
+        image_size = out_data.shape
+        input_ones = torch.ones(image_size)
+
+        UNF = torch.nn.Unfold((128, 128), stride=fold_stride)
+        out_data_unf = UNF(out_data)
+        unf_shape = out_data_unf.shape
+        out_data_unf = out_data_unf.view(128, 128, unf_shape[2])
+
+        out_data_unf = torch.transpose(out_data_unf, 0, 2)
+        out_data_unf = torch.transpose(out_data_unf, 1, 2)
+        out_data_unf = torch.unsqueeze(out_data_unf, 1)
+
+        out_data_unf = out_data_unf.detach().numpy()
+        with warnings.catch_warnings():  # ignore warnings of mean of nans
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            window_mean = np.nanmean(out_data_unf.reshape((len(out_data_unf), -1)), axis=1)
+        window_mean[np.isnan(window_mean)] = 0
+        for im in range(len(out_data_unf)):
+            out_data_unf[im][np.isnan(out_data_unf[im])] = window_mean[im]
+
+        corrected_im = predict_with_model(model, out_data_unf, norm_params_inputs, norm_params_outputs)
+        corrected_im = torch.tensor(corrected_im)
+        corrected_im = torch.squeeze(corrected_im)
+        corrected_im = torch.transpose(corrected_im, 2, 1)
+        corrected_im = torch.transpose(corrected_im, 2, 0)
+        corrected_im = corrected_im.view(unf_shape)
+
+        FLD = torch.nn.Fold((image_size[2], image_size[3]), (128, 128), stride=fold_stride)
+        corrected_im = FLD(corrected_im)
+        divisor = FLD(UNF(input_ones))
+        corrected_im = corrected_im / divisor
+        corrected_im = corrected_im.detach().numpy()[0, 0, :saves['AOD_CORR'].shape[1], :saves['AOD_CORR'].shape[2]]
+        corrected_im[nan_mask[:saves['AOD_CORR'].shape[1], :saves['AOD_CORR'].shape[2]]] = np.nan
+        saves['AOD_CORR'][ii] = corrected_im
+    print('Done! (Duration: {:.2f} s)\n'.format(time.time() - t0))
+# ##################
 
 # write outputs to a netCDF file
 outputfile = os.path.join(OUTPUTDIR, 'POPCORN_CORR_{}.nc'.format(SYfilename_original.replace('.zip', '')))

@@ -1,6 +1,7 @@
 # POPCORN Sentinel-3 Synergy aerosol parameter post-process correction
 
 A Python script to post-process correct the Sentinel-3 Synergy (SY_2_SYN) aerosol data products.
+Includes both the accuracy correction and spatial anomaly correction.
 
 * Developed by: Finnish Meteorological Institute and University of Eastern Finland
 * Development of the algorithm was funded by the European Space Agency EO science for society programme via POPCORN project.
